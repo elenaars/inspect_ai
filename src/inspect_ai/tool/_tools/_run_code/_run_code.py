@@ -8,7 +8,10 @@ from inspect_ai._util.content import (
     ContentText,
 )
 from inspect_ai._util.error import pip_dependency_error
+from inspect_ai.model._chat_message import ChatMessageUser
+from inspect_ai.model._tokens import count_text_tokens as local_estimate_tokens
 
+from ....model._model import Model, get_model
 from ..._tool import Tool, tool
 from ..._tool_def import ToolDef
 from .._execute import code_viewer
@@ -109,30 +112,118 @@ def _format_run_code_result(
     return content
 
 
-def _truncate_content(content: list[Content], max_chars: int | None) -> list[Content]:
-    if max_chars is None:
-        return content
-    result: list[Content] = []
-    remaining = max_chars
-    for item in content:
-        if not isinstance(item, ContentText):
-            result.append(item)
-            continue
-        if remaining <= 0:
-            continue
-        if len(item.text) <= remaining:
-            result.append(item)
-            remaining -= len(item.text)
-            continue
-        suffix = f"... [truncated to {max_chars} chars]"
-        if remaining > len(suffix):
-            text = item.text[: remaining - len(suffix)] + suffix
-        elif remaining > len(TRUNCATION_MARKER):
-            text = item.text[: remaining - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
+async def _fit_fallback_text(
+    candidates: list[str], remaining: int, model: Model
+) -> str | None:
+    """Try candidate strings in order, return the first that fits remaining tokens.
+
+    Candidates ordered from most to least informative — the first
+    one whose token count fits the budget wins. Returns None if none fit.
+    """
+    for candidate in candidates:
+        if await model.count_tokens(candidate) <= remaining:
+            return candidate
+    return None
+
+
+async def _truncate_text_to_tokens(
+    text: str, max_output_tokens: int, model: Model
+) -> str:
+    """Truncate text to fit within max_tokens, appending a marker."""
+    if max_output_tokens <= 0:
+        return ""
+
+    suffix = await _fit_fallback_text(
+        ["... [truncated: output exceeded token budget]", TRUNCATION_MARKER],
+        max_output_tokens,
+        model,
+    )
+    if suffix is None:
+        return ""
+    suffix_tokens = await model.count_tokens(suffix)
+
+    remaining = max_output_tokens - suffix_tokens
+
+    # non-network estimate used only to pick a starting point for the search
+    full_local_tokens = local_estimate_tokens(text)
+    ratio = len(text) / full_local_tokens if full_local_tokens else 1
+    start = max(0, min(len(text), int(remaining * ratio)))
+
+    start_tokens = await model.count_tokens(text[:start])
+
+    if start_tokens <= remaining:
+        lo, hi = start, len(text)
+        best = start
+    else:
+        lo, hi = 0, start
+        best = 0
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate_tokens = await model.count_tokens(text[:mid])
+        if candidate_tokens <= remaining:
+            best = mid
+            lo = mid + 1
         else:
-            text = TRUNCATION_MARKER[:remaining]
-        result.append(ContentText(text=text))
-        remaining = 0
+            hi = mid - 1
+
+    result = text[:best] + suffix
+
+    # boundary effect guard: count(prefix) + count(suffix) isn't guaranteed to
+    # equal count(prefix + suffix) — a BPE merge can occur across the join.
+    while best > 0 and await model.count_tokens(result) > max_output_tokens:
+        best -= 1
+        result = text[:best] + suffix
+    return result
+
+
+async def _truncate_content(
+    content: list[Content], max_tokens: int | None
+) -> list[Content]:
+    """Truncate content to fit within a token budget.
+
+    Processes items in consecutive order.
+    Once an item doesn't fit, it is truncated or replaced with a fallback,
+    and no subsequent items are included.
+
+    """
+    if max_tokens is None:
+        return content
+
+    model = get_model()
+    result: list[Content] = []
+    remaining = max_tokens
+
+    for item in content:
+        if remaining <= 0:
+            break
+
+        if isinstance(item, ContentText):
+            token_cost = await model.count_tokens(item.text)
+            if token_cost <= remaining:
+                result.append(item)
+                remaining -= token_cost
+            else:
+                text = await _truncate_text_to_tokens(item.text, remaining, model)
+                if text:
+                    result.append(ContentText(text=text))
+                remaining = 0
+        else:
+            token_cost = await model.count_tokens([ChatMessageUser(content=[item])])
+            if token_cost <= remaining:
+                result.append(item)
+                remaining -= token_cost
+            else:
+                placeholder_text = (
+                    f"[{type(item).__name__} omitted: exceeded token budget]"
+                )
+                fallback = await _fit_fallback_text(
+                    [placeholder_text, TRUNCATION_MARKER], remaining, model
+                )
+                if fallback is None:
+                    break
+                result.append(ContentText(text=fallback))
+                remaining = 0
     return result
 
 
@@ -182,6 +273,15 @@ def _run_code_usage_description(tool_defs: list[ToolDef]) -> str:
         "Only a limited set of standard-library imports is available, such as asyncio, json, re, math, and datetime. Tool calls must be awaited.",
         "The final expression is returned as the run_code result.",
         "",
+        "Tool results may contain non-text content (images, audio, video, documents) as opaque "
+        "binary/media objects, not strings:",
+        "- If a tool returns a list mixing text and media content, INDEX INTO the list "
+        "(e.g. result[1]) to extract the specific item before passing it to another tool "
+        "- Do NOT use str(), repr(), f-strings, or manual byte-level parsing/decoding on them.",
+        "- Pass or return them as-is (directly, or inside plain lists/dicts) so they reach the "
+        "final result as real media content.",
+        "that expects a single typed Content object — do not pass the whole list.",
+        "",
     ]
 
     if tool_defs:
@@ -203,6 +303,13 @@ def _run_code_usage_description(tool_defs: list[ToolDef]) -> str:
                 "results",
                 "```",
                 "",
+                "",
+                "Example — indexing into a mixed list before passing to a typed tool:",
+                "```python",
+                "screenshot = await fake_screenshot()",
+                "# screenshot is [ContentText, ContentImage] — index to get the image alone",
+                "metadata = await image_metadata(screenshot[1])",
+                "```",
                 _tool_interface_description(tool_defs),
             ]
         )
@@ -224,7 +331,7 @@ def run_code(
     executor: RunCodeExecutor | Literal["monty"] = "monty",
     max_inner_tool_calls: int | None = None,
     include_tool_call_trace: bool = False,
-    max_output_chars: int | None = None,
+    max_output_tokens: int | None = None,
 ) -> Tool:
     """Run Python code that can orchestrate selected tools.
 
@@ -235,7 +342,7 @@ def run_code(
             or pass a custom RunCodeExecutor for tests / alternative backends.
         max_inner_tool_calls: Maximum number of allowlisted tool calls from inside run_code.
         include_tool_call_trace: Whether to include a compact trace of inner tool calls in the result.
-        max_output_chars: Maximum number of characters returned by run_code. If None, output is not truncated.
+        max_output_tokens: Maximum number of tokens returned by run_code. If None, output is not truncated.
     """
     tool_defs = _tool_defs(tools)
     _validate_tool_names(tool_defs)
@@ -267,7 +374,7 @@ def run_code(
             include_tool_call_trace=include_tool_call_trace,
         )
 
-        return _truncate_content(formatted, max_output_chars)
+        return await _truncate_content(formatted, max_output_tokens)
 
     return ToolDef(
         execute,

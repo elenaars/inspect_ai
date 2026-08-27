@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from pydantic import TypeAdapter
 from pydantic_core import to_jsonable_python
 
 from ...._util.content import (
@@ -24,6 +25,8 @@ from ..._tool_def import ToolDef
 
 if TYPE_CHECKING:
     from ....event._tool import ToolEvent
+
+_content_adapter: TypeAdapter[list[Content]] = TypeAdapter(list[Content])
 
 
 def _preview(value: Any, *, max_chars: int = 500) -> str:
@@ -57,28 +60,16 @@ def _tool_call_arguments(
 
 def _content_to_runtime_value(
     content: list[Content],
-) -> tuple[str, list[Content]]:
-    """Extract text for Monty runtime, collecting non-text content as artifacts."""
-    text_parts: list[str] = []
-    collected_artifacts: list[Content] = []
-
-    for item in content:
-        match item:
-            case ContentText():
-                # Only text is projected into the Monty runtime.
-                text_parts.append(item.text)
-            case _:
-                # All other content types are preserved as artifacts.
-                collected_artifacts.append(item)
-
-    if text_parts:
-        return "\n".join(text_parts), collected_artifacts
-
-    return (
-        f"[{len(collected_artifacts)} non-text artifact(s) generated]",
-        collected_artifacts,
-    )
-
+    *,
+    preserve_list_shape: bool,
+) -> Any:
+    """Serialize Content into a Monty-native value crossing the boundary."""
+    if not preserve_list_shape:
+        item = content[0]
+        if isinstance(item, ContentText):
+            return item.text
+        return _content_adapter.dump_python([item], mode="json")[0]
+    return _content_adapter.dump_python(content, mode="json")
 
 
 def _format_tool_error(error: ToolCallError) -> str:
@@ -244,7 +235,6 @@ class RunCodeToolBridge:
         self.tool_defs = tool_defs
         self.max_tool_calls = max_inner_tool_calls
         self.call_trace: list[RunCodeInnerToolCallTraceEntry] = []
-        self.artifacts: list[Content] = []
         self.control_flow_exception: BaseException | None = None
 
     def raise_pending_control_flow(self) -> None:
@@ -288,15 +278,11 @@ class RunCodeToolBridge:
             kwargs_preview=_preview(kwargs),
         )
         self.call_trace.append(call_trace_entry)
-        artifacts_before = len(self.artifacts)
 
         try:
             result = await self._execute_inspect_tool_call(tool_def, arguments)
             value = self._project_result(result, tool_def.name)
-            artifact_count = len(self.artifacts) - artifacts_before
-            call_trace_entry.result_preview = (
-                f"{_preview(value)} | artifacts={artifact_count}"
-            )
+            call_trace_entry.result_preview = f"{_preview(value)}"
             return value
         except BaseException as exc:
             call_trace_entry.error = str(exc)
@@ -310,20 +296,27 @@ class RunCodeToolBridge:
         Three cases:
           - Scalars (str/int/float/bool) cross natively so code can chain them
             into later calls or compute on them.
-          - Content results are handled at the boundary: ContentText is projected
-            into the runtime as text, while non-text Content is kept outside the
-            runtime and appended to the final run_code result as artifacts.
-          - JSON-serializable structured data is converted to native Python values
-            so code can index, iterate, and aggregate over it.
+          - Content results are serialized at the boundary via Pydantic
+            `dump_python`. The shape mirrors what the tool actually returned:
+            - a bare ContentText object projects as plain text;
+            - any other bare (non-list) Content object projects as a single
+              serialized dict;
+            - a Content list is always serialized as a list, preserving that
+              shape even when it contains exactly one item, so downstream code
+              and inner tool calls see the same shape the tool declared.
+          - JSON-serializable structured data is converted to native Python
+            values via `to_jsonable_python` so code can index, iterate, and
+            aggregate over it.
         """
         if isinstance(result, (str, int, float, bool)):
             return result
 
         if self._is_content_result(result):
-            content = result if isinstance(result, list) else [result]
-            text, new_artifacts = _content_to_runtime_value(content)
-            self.artifacts.extend(new_artifacts)
-            return text
+            preserve_list_shape = isinstance(result, list)
+            content = result if preserve_list_shape else [result]
+            return _content_to_runtime_value(
+                content, preserve_list_shape=preserve_list_shape
+            )
 
         try:
             return to_jsonable_python(result, fallback=lambda value: str(value))
